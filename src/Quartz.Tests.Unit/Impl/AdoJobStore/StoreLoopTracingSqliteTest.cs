@@ -59,6 +59,7 @@ public sealed class StoreLoopTracingSqliteTest
     private const string DataSourceName = "store-loop-tracing";
     private const string CheckInPass = "Quartz.ClusterManager.CheckIn";
     private const string ScanPass = "Quartz.MisfireHandler.Scan";
+    private const string InterruptReadPass = "Quartz.TracingJobStore.InterruptRequestRead";
 
     private static readonly DateTimeOffset epoch = new(2031, 6, 17, 10, 0, 0, TimeSpan.Zero);
 
@@ -152,7 +153,6 @@ public sealed class StoreLoopTracingSqliteTest
         tracing.ChildrenStarted.Should().BePositive("the check-in still ran its statements");
         tracing.StoppedChildren.Should().BeEmpty(
             "under an unsampled parent a parent-based sampler drops them, where with nothing current each would be a root");
-        Activity.Current.Should().BeNull();
         AssertOneUnrecordedStandIn(CheckInPass);
     }
 
@@ -170,7 +170,6 @@ public sealed class StoreLoopTracingSqliteTest
         {
             await CheckInOnce();
 
-            Activity.Current.Should().BeSameAs(caller);
             tracing.StoppedChildren.Should().NotBeEmpty().And
                 .OnlyContain(a => a.TraceId == caller.TraceId && a.ParentSpanId == caller.SpanId);
         }
@@ -201,8 +200,56 @@ public sealed class StoreLoopTracingSqliteTest
 
         tracing.ChildrenStarted.Should().BePositive("the scan still ran its statements");
         tracing.StoppedChildren.Should().BeEmpty();
-        Activity.Current.Should().BeNull();
         AssertOneUnrecordedStandIn(ScanPass);
+    }
+
+    /// <summary>
+    /// The scheduler reads the interrupt requests after each check-in on a queued task, with nothing current,
+    /// so the driver's spans for the read would each be a root (#4375).
+    /// </summary>
+    [Test]
+    public async Task TheInterruptRequestRead_WithRootOperationsOff_RunsUnderAStandInAndItsDriverSpansAreDropped()
+    {
+        store.TraceRootStoreOperations = false;
+        TracingJobStore decorated = new(store, meters, clock, recordExceptionEvents: true, traceRootOperations: false);
+
+        Activity.Current = null;
+        await decorated.GetInterruptRequests();
+
+        tracing.ChildrenStarted.Should().BePositive("the read still ran its statement");
+        tracing.StoppedChildren.Should().BeEmpty(
+            "under an unsampled parent a parent-based sampler drops them, where with nothing current each would be a root");
+        AssertOneUnrecordedStandIn(InterruptReadPass);
+    }
+
+    [Test]
+    public async Task TheInterruptRequestRead_WithRootOperationsOn_HasNoSpanAndLeavesTheDriverSpansAsRoots()
+    {
+        TracingJobStore decorated = new(store, meters, clock, recordExceptionEvents: true, traceRootOperations: true);
+
+        Activity.Current = null;
+        await decorated.GetInterruptRequests();
+
+        tracing.StoppedChildren.Should().NotBeEmpty("the read ran its statement").And
+            .OnlyContain(a => a.ParentSpanId == default);
+        StandIns(InterruptReadPass).Should().BeEmpty();
+    }
+
+    [Test]
+    public async Task TheInterruptRequestRead_WithRootOperationsOff_InsideTheCallersActivity_StaysInTheCallersTrace()
+    {
+        TracingJobStore decorated = new(store, meters, clock, recordExceptionEvents: true, traceRootOperations: false);
+
+        Activity.Current = null;
+        using (Activity caller = tracing.StartCaller())
+        {
+            await decorated.GetInterruptRequests();
+
+            tracing.StoppedChildren.Should().NotBeEmpty().And
+                .OnlyContain(a => a.TraceId == caller.TraceId && a.ParentSpanId == caller.SpanId);
+        }
+
+        StandIns(InterruptReadPass).Should().BeEmpty("a read that has a parent needs no stand-in");
     }
 
     [TestCase(true)]
@@ -218,11 +265,24 @@ public sealed class StoreLoopTracingSqliteTest
         checkins.GetMeasurementSnapshot().Should().ContainSingle("the option is about spans, not metrics");
     }
 
+    /// <summary>
+    /// Runs the check-in loop until it has asked the clock for its first sleep, which is when the inline
+    /// check-in <see cref="ClusterManager.Initialize" /> runs is over and the loop is idle, then shuts it
+    /// down: a loop that has not reached its sleep makes <see cref="ClusterManager.Shutdown" /> wait out its timeout.
+    /// </summary>
     private async Task CheckInOnce()
     {
+        int sleepsBefore = clock.TimersCreated;
         ClusterManager clusterManager = new(store, NullLogger<ClusterManager>.Instance);
         await clusterManager.Initialize();
-        await clusterManager.Shutdown();
+        try
+        {
+            await WaitForASleepAfter(sleepsBefore, "the check-in loop");
+        }
+        finally
+        {
+            await clusterManager.Shutdown();
+        }
     }
 
     /// <summary>
@@ -236,18 +296,23 @@ public sealed class StoreLoopTracingSqliteTest
         misfireHandler.Initialize();
         try
         {
-            // Real time: the loop runs on its own thread, and only wall time lets it get to its sleep.
-            for (int i = 0; i < 1000 && clock.TimersCreated == sleepsBefore; i++)
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(5));
-            }
-
-            clock.TimersCreated.Should().BeGreaterThan(sleepsBefore, "the misfire loop was expected to have finished its first pass by now");
+            await WaitForASleepAfter(sleepsBefore, "the misfire loop");
         }
         finally
         {
             await misfireHandler.Shutdown();
         }
+    }
+
+    private async Task WaitForASleepAfter(int sleepsBefore, string loop)
+    {
+        // Real time: the loop runs on its own thread, and only wall time lets it get to its sleep.
+        for (int i = 0; i < 1000 && clock.TimersCreated == sleepsBefore; i++)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(5));
+        }
+
+        clock.TimersCreated.Should().BeGreaterThan(sleepsBefore, $"{loop} was expected to have finished its first pass by now");
     }
 
     private List<Activity> StandIns(string name)

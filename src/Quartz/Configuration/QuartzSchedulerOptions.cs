@@ -159,7 +159,8 @@ public sealed class QuartzSchedulerOptions
     /// emitted, and under a parent-based sampler — OpenTelemetry's default — the spans the database driver
     /// opens beneath it are dropped with it rather than becoming roots of their own. The ADO.NET store's
     /// misfire scan and cluster check-in, which query the database outside any store call, run each pass
-    /// under the same activity.
+    /// under the same activity, and so does the read of the interrupt requests of this node's firings that
+    /// follows each check-in.
     /// </para>
     /// <para>
     /// The rule is about the ambient activity, not about the loop. A store call made inside the caller's

@@ -76,9 +76,10 @@ services.AddQuartz(q => q.ConfigureScheduler(options => options.TraceRootStoreOp
   parent-based sampler, OpenTelemetry's default, the SqlClient or Npgsql spans beneath it are dropped too. With
   nothing current they would each be a root, one trace per query. A sampler that is not parent-based, such as
   `AlwaysOnSampler`, still exports them, under a parent that is never exported.
-- **The ADO.NET store's own loops follow it too.** Its misfire check and, on a cluster, its check-in query the
-  database outside any store call. Each pass of either runs under the same unsampled activity, so their driver
-  spans are dropped too, rather than each check-in being a trace of its own.
+- **From 4.9, the ADO.NET store's own loops follow it too.** Its misfire check and, on a cluster, its check-in
+  and the read of its firings' interrupt requests after each one query the database outside any store call. Each
+  pass of the first two, and each read, runs under the same unsampled activity, so their driver spans are dropped
+  too, rather than each check-in being a trace of its own.
 - **The rule is the ambient activity, not the loop.** A store call made inside a request keeps its span in that
   request's trace. A call made outside any activity, at startup for example, loses its span as the loop's do. The
   first check-in runs from `Start()`, so started inside a request it stays in that request's trace.

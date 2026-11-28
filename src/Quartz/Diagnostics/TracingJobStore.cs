@@ -54,6 +54,9 @@ namespace Quartz.Diagnostics;
 /// </remarks>
 internal sealed class TracingJobStore : DelegatingJobStore, ISharedExecutionGroupSource
 {
+    /// <summary>The name of the unrecorded stand-in the interrupt-request read runs under. Nothing exports it.</summary>
+    private const string InterruptReadName = "Quartz.TracingJobStore.InterruptRequestRead";
+
     private readonly ActivitySource activitySource;
     private readonly Meters meters;
     private readonly TimeProvider timeProvider;
@@ -381,16 +384,36 @@ internal sealed class TracingJobStore : DelegatingJobStore, ISharedExecutionGrou
     }
 
     /// <summary>
-    /// Hands the read of this node's interrupt requests on without a span of its own.
+    /// Hands the read of this node's interrupt requests on without a span of its own, and with
+    /// <see cref="QuartzSchedulerOptions.TraceRootStoreOperations" /> off, under the unrecorded stand-in.
     /// </summary>
     /// <remarks>
-    /// Declared rather than inherited only to say so. The scheduler asks it after every cluster check-in,
-    /// off any caller's flow, so a span here would be a new root trace every check-in of every node: the
-    /// unbounded-trace shape #3797 took out.
+    /// <para>
+    /// The scheduler asks it after every cluster check-in, off any caller's flow, so a span here would be a
+    /// new root trace every check-in of every node: the unbounded-trace shape #3797 took out.
+    /// </para>
+    /// <para>
+    /// The read is queued with no execution context, so nothing is current when it runs, and the database
+    /// driver's spans for it would each be a root of their own. With the option off it therefore gets what
+    /// <see cref="Begin" /> gives any store call made outside an activity, under the same gate, so that a
+    /// parent-based sampler drops them (#4375). The stand-in is started and stopped by a method of its own,
+    /// so both happen in one execution context and it never stays current for the caller.
+    /// </para>
     /// </remarks>
     public override ValueTask<List<string>> GetInterruptRequests(CancellationToken cancellationToken = default)
     {
-        return InnerJobStore.GetInterruptRequests(cancellationToken);
+        if (traceRootOperations || Activity.Current is not null || !activitySource.HasListeners())
+        {
+            return InnerJobStore.GetInterruptRequests(cancellationToken);
+        }
+
+        return GetInterruptRequestsUnrecorded(cancellationToken);
+    }
+
+    private async ValueTask<List<string>> GetInterruptRequestsUnrecorded(CancellationToken cancellationToken)
+    {
+        using Activity standIn = QuartzActivitySource.Unrecorded(InterruptReadName).Start();
+        return await InnerJobStore.GetInterruptRequests(cancellationToken).ConfigureAwait(false);
     }
 
     public override ValueTask<bool> DeleteJob(JobKey jobKey, CancellationToken cancellationToken = default)
